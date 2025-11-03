@@ -2,7 +2,6 @@ import base64
 import json
 import logging
 import os
-from typing import Dict, Tuple
 
 import azure.cognitiveservices.speech as speechsdk
 import azure.functions as func
@@ -13,44 +12,6 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 app = func.FunctionApp()
-
-
-LANGUAGE_LOCALE_MAP: Dict[str, str] = {
-    "English": "en-US",
-    "Spanish": "es-ES",
-    "French": "fr-FR",
-    "German": "de-DE",
-    "Hindi": "hi-IN",
-    "Chinese": "zh-CN",
-    "Japanese": "ja-JP",
-}
-
-LANGUAGE_CODE_MAP: Dict[str, str] = {
-    "English": "en",
-    "Spanish": "es",
-    "French": "fr",
-    "German": "de",
-    "Hindi": "hi",
-    "Chinese": "zh-Hans",
-    "Japanese": "ja",
-}
-
-VOICE_MAP: Dict[Tuple[str, str], str] = {
-    ("English", "Female Voice 1"): "en-US-JennyNeural",
-    ("English", "Male Voice 1"): "en-US-GuyNeural",
-    ("Spanish", "Female Voice 1"): "es-ES-ElviraNeural",
-    ("Spanish", "Male Voice 1"): "es-ES-AlvaroNeural",
-    ("French", "Female Voice 1"): "fr-FR-DeniseNeural",
-    ("French", "Male Voice 1"): "fr-FR-HenriNeural",
-    ("German", "Female Voice 1"): "de-DE-KatjaNeural",
-    ("German", "Male Voice 1"): "de-DE-ConradNeural",
-    ("Hindi", "Female Voice 1"): "hi-IN-SwaraNeural",
-    ("Hindi", "Male Voice 1"): "hi-IN-MadhurNeural",
-    ("Chinese", "Female Voice 1"): "zh-CN-XiaoxiaoNeural",
-    ("Chinese", "Male Voice 1"): "zh-CN-YunhaoNeural",
-    ("Japanese", "Female Voice 1"): "ja-JP-NanamiNeural",
-    ("Japanese", "Male Voice 1"): "ja-JP-DaichiNeural",
-}
 
 
 @app.route(route="translate", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -73,12 +34,12 @@ def translate(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    source_language = req_body.get("source_language")
-    target_language = req_body.get("target_language")
+    source_locale = req_body.get("source_locale")
+    target_locale = req_body.get("target_locale")
     neural_voice = req_body.get("neural_voice")
     audio_data_b64 = req_body.get("audio_data")
 
-    if not all([source_language, target_language, neural_voice, audio_data_b64]):
+    if not all([source_locale, target_locale, neural_voice, audio_data_b64]):
         logging.warning("Missing required fields in request body")
         return func.HttpResponse(
             json.dumps({"error": "Missing required fields"}),
@@ -88,8 +49,8 @@ def translate(req: func.HttpRequest) -> func.HttpResponse:
 
     logging.info(
         "Processing request: %s -> %s, voice: %s",
-        source_language,
-        target_language,
+        source_locale,
+        target_locale,
         neural_voice,
     )
 
@@ -108,17 +69,17 @@ def translate(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         current_stage = "speech_to_text"
-        transcribed_text = speech_to_text(audio_bytes, source_language)
+        transcribed_text = speech_to_text(audio_bytes, source_locale)
         logging.info("Stage %s output: %s", current_stage, transcribed_text)
 
         current_stage = "translate_text"
         translated_text = translate_text(
-            transcribed_text, source_language, target_language
+            transcribed_text, source_locale, target_locale
         )
         logging.info("Stage %s output: %s", current_stage, translated_text)
 
         current_stage = "text_to_speech"
-        translated_audio = text_to_speech(translated_text, target_language, neural_voice)
+        translated_audio = text_to_speech(translated_text, target_locale, neural_voice)
         logging.info("Stage %s complete: %d bytes generated", current_stage, len(translated_audio))
     except Exception as exc:  # pylint: disable=broad-except
         logging.exception("Processing pipeline failed at stage %s", current_stage)
@@ -135,10 +96,8 @@ def translate(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
-def speech_to_text(audio_bytes: bytes, source_language: str) -> str:
-    """Convert audio to text using Azure Speech Service"""
-
-    locale = LANGUAGE_LOCALE_MAP.get(source_language, "en-US")
+def speech_to_text(audio_bytes: bytes, locale: str) -> str:
+    """Convert audio to text using Azure Speech Service using the provided locale."""
 
     speech_key = os.getenv("AZURE_SPEECH_KEY") or os.getenv("AZURE_SPEECH_API_KEY")
     speech_region = os.getenv("AZURE_SPEECH_REGION") or os.getenv("AZURE_SPEECH_LOCATION")
@@ -157,7 +116,21 @@ def speech_to_text(audio_bytes: bytes, source_language: str) -> str:
         locale,
     )
 
-    audio_stream = speechsdk.audio.PushAudioInputStream()
+    # NEW: Define audio format explicitly (16kHz, 16-bit, mono PCM)
+    audio_format = speechsdk.audio.AudioStreamFormat(
+        samples_per_second=16000,
+        bits_per_sample=16,
+        channels=1
+    )
+
+    # NEW: Create push stream with format specification
+    audio_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
+
+    # NEW: Strip WAV header (first 44 bytes) if present
+    if len(audio_bytes) > 44 and audio_bytes[:4] == b"RIFF":
+        logging.info("WAV header detected, stripping 44 bytes")
+        audio_bytes = audio_bytes[44:]
+
     audio_stream.write(audio_bytes)
     audio_stream.close()
 
@@ -178,11 +151,16 @@ def speech_to_text(audio_bytes: bytes, source_language: str) -> str:
     raise RuntimeError(f"STT failed: {result.reason}")
 
 
-def translate_text(text: str, source_language: str, target_language: str) -> str:
-    """Translate text using Azure Translator"""
+def translate_text(text: str, source_locale: str, target_locale: str) -> str:
+    """Translate text using Azure Translator based on locale-derived language codes."""
 
-    from_lang = LANGUAGE_CODE_MAP.get(source_language, "en")
-    to_lang = LANGUAGE_CODE_MAP.get(target_language, "es")
+    def _extract_language_code(locale: str) -> str:
+        return locale.split("-", 1)[0] if locale else ""
+
+    from_lang = _extract_language_code(source_locale)
+    to_lang = _extract_language_code(target_locale)
+    if not from_lang or not to_lang:
+        raise RuntimeError("Invalid locale provided for translation")
 
     raw_endpoint = (
         os.getenv("AZURE_TRANSLATE_ENDPOINT")
@@ -243,23 +221,26 @@ def translate_text(text: str, source_language: str, target_language: str) -> str
         raise RuntimeError(f"Translator unexpected response: {result}") from exc
 
 
-def text_to_speech(text: str, target_language: str, neural_voice: str) -> bytes:
-    """Convert text to speech using Azure Speech Service"""
+def text_to_speech(text: str, target_locale: str, neural_voice: str) -> bytes:
+    """Convert text to speech using Azure Speech Service with the provided neural voice name."""
 
     speech_key = os.getenv("AZURE_SPEECH_KEY")
     speech_region = os.getenv("AZURE_SPEECH_REGION")
     if not speech_key or not speech_region:
         raise RuntimeError("Azure Speech credentials are not configured")
 
-    voice_name = VOICE_MAP.get((target_language, neural_voice))
-    if not voice_name:
-        raise RuntimeError(f"Unsupported voice selection: {target_language} / {neural_voice}")
-
     speech_config = speechsdk.SpeechConfig(
         subscription=speech_key,
         region=speech_region,
     )
-    speech_config.speech_synthesis_voice_name = voice_name
+    speech_config.speech_synthesis_voice_name = neural_voice
+    logging.info(
+        "Stage %s config: region=%s locale=%s voice=%s",
+        "text_to_speech",
+        speech_region,
+        target_locale,
+        neural_voice,
+    )
 
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
     result = synthesizer.speak_text_async(text).get()
